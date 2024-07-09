@@ -4,27 +4,28 @@ import GObject from 'gi://GObject';
 import type Gio from 'gi://Gio';
 import Graphene from 'gi://Graphene';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 
 // gnome-shell modules
-import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import {layoutManager, overview} from 'resource:///org/gnome/shell/ui/main.js';
-import {WindowPreview} from 'resource:///org/gnome/shell/ui/windowPreview.js';
-import {WorkspaceAnimationController} from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
+import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
+import { layoutManager, overview } from 'resource:///org/gnome/shell/ui/main.js';
+import { WindowPreview } from 'resource:///org/gnome/shell/ui/windowPreview.js';
+import { WorkspaceAnimationController } from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 
 // local modules
-import {Services} from './dbus/services.js';
-import {LinearFilterEffect} from './effect/linear_filter_effect.js';
-import {RoundedCornersEffect} from './effect/rounded_corners_effect.js';
-import {WindowActorTracker} from './manager/effect_manager.js';
-import {connections} from './utils/connections.js';
-import {constants} from './utils/constants.js';
-import {_log, stackMsg} from './utils/log.js';
-import {init_settings, uninit_settings, settings} from './utils/settings.js';
+import { Services } from './dbus/services.js';
+import { LinearFilterEffect } from './effect/linear_filter_effect.js';
+import { RoundedCornersEffect } from './effect/rounded_corners_effect.js';
+import { WindowActorTracker } from './manager/effect_manager.js';
+import { connections } from './utils/connections.js';
+import { constants } from './utils/constants.js';
+import { _log, stackMsg } from './utils/log.js';
+import { init_settings, uninit_settings, settings } from './utils/settings.js';
 import * as UI from './utils/ui.js';
 
 // types, which will be removed in output
-import type {RoundedCornersCfg} from './utils/types.js';
-import type {ExtensionsWindowActor} from './utils/types.js';
+import type { RoundedCornersCfg } from './utils/types.js';
+import type { ExtensionsWindowActor } from './utils/types.js';
 
 // --------------------------------------------------------------- [end imports]
 
@@ -85,30 +86,37 @@ export default class RoundedWindowCornersReborn extends Extension {
         // corners window into overview.
         //
         WindowPreview.prototype._addWindow = function (window) {
-            // call original method from gnome-shell
-            self._orig_add_window.apply(this, [window]);
+            // Copy original method here, since we would need clone variable later
+            const layoutManager: Shell.WindowPreviewLayout = this
+                .window_container.layout_manager as Shell.WindowPreviewLayout;
+            const clone = layoutManager.add_window(window);
+            if (!clone) {
+                return;
+            }
 
-            // Make sure patched method only be called in _init() of
-            // WindowPreview
-            // https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/main/js
-            // /ui/windowPreview.js#L42
+            _log(`Adding ${window.title} to the windowPreview`);
+
+            // Shell.util_set_hidden_from_pick(clone, true);
+
+            // Make sure patched method only be called in _init() of WindowPreview
+            // https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/main/js/ui/windowPreview.js#L42
 
             const stack = stackMsg();
             if (
-                stack === undefined ||
-                stack.indexOf('_updateAttachedDialogs') !== -1 ||
-                stack.indexOf('addDialog') !== -1
+                stack === undefined
+                //stack.indexOf('_updateAttachedDialogs') !== -1 ||
+                //stack.indexOf('addDialog') !== -1
             ) {
                 return;
             }
 
-            // If the window don't have rounded corners and shadows,
-            // just return
+            // If the window don't have rounded corners and shadows just return
             let cfg: RoundedCornersCfg | null = null;
             let has_rounded_corners = false;
-            const window_actor: ExtensionsWindowActor =
-                window.get_compositor_private() as ExtensionsWindowActor;
-            const shadow = window_actor.__rwc_rounded_window_info?.shadow;
+            const windowActor =
+                window.get_compositor_private() as Meta.WindowActor;
+            const shadow = (windowActor as ExtensionsWindowActor)
+                .__rwc_rounded_window_info?.shadow;
             if (shadow) {
                 cfg = UI.ChoiceRoundedCornersCfg(
                     settings().global_rounded_corner_settings,
@@ -123,106 +131,82 @@ export default class RoundedWindowCornersReborn extends Extension {
 
             _log(`Add shadow for ${window.title} in overview`);
 
-            // WindowPreview.windowContainer used to show content of window
-            const windowContainer = this.windowContainer;
-            let firstChild: Clutter.Actor | null = windowContainer.firstChild;
+            // Create a shadow copy and add it below window actor in window_container
+            const shadow_actor = new OverviewShadowActor(
+                shadow,
+                clone
+            );
+            this.window_container.insert_child_below(shadow_actor, clone);
 
-            // Set linear filter to let it looks better
-            firstChild?.add_effect(new LinearFilterEffect());
+            clone.add_effect(new LinearFilterEffect());
 
-            // Add a clone of shadow to overview
-            const shadow_clone = new OverviewShadowActor(shadow, this);
-            for (const prop of ['scale-x', 'scale-y']) {
-                windowContainer.bind_property(prop, shadow_clone, prop, 1);
-            }
-            this.insert_child_below(shadow_clone, windowContainer);
+            // Disable rounding on window itself to avoid blurry preview
+            const window_rounding_effect =
+                UI.get_rounded_corners_effect(windowActor);
+            window_rounding_effect?.set_enabled(false);
 
-            // In Gnome 43, preview windows in overview will be blurry if there are
-            // more than two workspaces using, We need add rounded corners to preview
-            // window in overview manually to avoid blurry preview windows.
-            type TypeRoundedCornersEffect =
-                | InstanceType<typeof RoundedCornersEffect>
-                | null
-                | undefined;
-            let rounded_effect_of_window_actor: TypeRoundedCornersEffect = null;
-            if (UI.shell_version() >= 43) {
-                // Name of rounded corners effect added to preview window
-                const name = 'Rounded Corners Effect (Overview)';
+            const effect_name = `${constants.ROUNDED_CORNERS_EFFECT} (Overview)`;
+            clone.add_effect_with_name(effect_name, new RoundedCornersEffect());
 
-                // Disabled rounded corners of window temporarily when enter overview
-                rounded_effect_of_window_actor = UI.get_rounded_corners_effect(
-                    window_actor,
-                ) as TypeRoundedCornersEffect;
-                rounded_effect_of_window_actor?.set_enabled(false);
+            const c = connections.get();
+            // Update uniform values whenever window's clone changes it's size
+            c.connect(clone, 'notify::width', () => {
+                const effect = clone.get_effect(effect_name) as InstanceType<
+                    typeof RoundedCornersEffect
+                >;
 
-                // Add rounded corners effect to preview window actor
-                firstChild?.add_effect_with_name(
-                    name,
-                    new RoundedCornersEffect(),
+                const frame_rect = window.get_frame_rect();
+                const buf_rect = window.get_buffer_rect();
+                const horizontal_scale = clone.width / frame_rect.width;
+                const vertical_scale = clone.height / frame_rect.height;
+                const x1 = (buf_rect.width - frame_rect.width) / 2 * horizontal_scale;
+                const y1 = (buf_rect.height - frame_rect.height) / 2 * vertical_scale;
+                const x2 = clone.width * horizontal_scale - x1;
+                const y2 = clone.height * vertical_scale - y1;
+
+                _log(`frame_rect: ${frame_rect.width}, ${frame_rect.height}`);
+                _log(`buf_rect: ${buf_rect.width}, ${buf_rect.height}`);
+                _log(`scales: ${horizontal_scale}, ${vertical_scale}`);
+                _log(`x1: ${x1}, y1: ${y1}`);
+                _log(`x2: ${x2}, y2: ${y2}`);
+
+                if (!effect) {
+                    return;
+                }
+
+                const scale_factor = UI.WindowScaleFactor(window) * horizontal_scale;
+                let pixel_step: [number, number] | undefined = undefined;
+                if (
+                    window.get_client_type() === Meta.WindowClientType.WAYLAND
+                ) {
+                    const surface = (
+                        window.get_compositor_private() as Meta.WindowActor
+                    ).firstChild;
+                    pixel_step = [
+                        1.0 / (scale_factor * surface.get_width()),
+                        1.0 / (scale_factor * surface.get_height()),
+                    ];
+                }
+
+                effect.update_uniforms(
+                    scale_factor,
+                    settings().global_rounded_corner_settings,
+                    { x1, y1, x2, y2 },
+                    { width: 0, color: [0, 0, 0, 0] },
+                    pixel_step,
                 );
-
-                // Update uniform variables of rounded corners effect when size of
-                // preview windows in overview changed.
-                const c = connections.get();
-                c.connect(this, 'notify::width', () => {
-                    const rounded_effect_of_preview_window =
-                        firstChild?.get_effect(
-                            name,
-                        ) as TypeRoundedCornersEffect;
-                    if (!rounded_effect_of_preview_window) {
-                        return;
-                    }
-
-                    const buf_rect = window.get_buffer_rect();
-                    const frame_rect = window.get_frame_rect();
-                    const scaled =
-                        this.windowContainer.get_width() / frame_rect.width;
-                    const x1 = (frame_rect.x - buf_rect.x) * scaled;
-                    const y1 = (frame_rect.y - buf_rect.y) * scaled;
-                    const x2 = x1 + frame_rect.width * scaled;
-                    const y2 = y1 + frame_rect.height * scaled;
-
-                    const scale_factor = UI.WindowScaleFactor(window) * scaled;
-                    let pixel_step: [number, number] | undefined = undefined;
-                    if (
-                        UI.shell_version() >= 43.1 &&
-                        window.get_client_type() ===
-                            Meta.WindowClientType.WAYLAND
-                    ) {
-                        const surface = (
-                            window.get_compositor_private() as Meta.WindowActor
-                        ).firstChild;
-                        pixel_step = [
-                            1.0 / (scale_factor * surface.get_width()),
-                            1.0 / (scale_factor * surface.get_height()),
-                        ];
-                    }
-                    rounded_effect_of_preview_window.update_uniforms(
-                        scale_factor,
-                        settings().global_rounded_corner_settings,
-                        {x1, y1, x2, y2},
-                        {width: 0, color: [0, 0, 0, 0]},
-                        pixel_step,
-                    );
-                });
-            }
-
-            // Disconnect all signals when Window preview in overview is destroy
-            c.connect(this, 'destroy', () => {
-                shadow_clone.destroy();
-                firstChild?.clear_effects();
-                firstChild = null;
-
-                // Enabled rounded corners of window actor when leaving overview,
-                // works for gnome 43.
+            });
+            // Cleanup after windowPreview is being destroyed
+            c.connect(clone, 'destroy', () => {
+                //shadow_actor.destroy();
+                clone.clear_effects();
                 if (
                     overview._overview.controls._workspacesDisplay
                         ._leavingOverview
                 ) {
-                    rounded_effect_of_window_actor?.set_enabled(true);
+                    window_rounding_effect?.set_enabled(true);
                 }
-
-                c.disconnect_all(this);
+                c.disconnect_all(clone);
             });
         };
 
@@ -331,7 +315,7 @@ export default class RoundedWindowCornersReborn extends Extension {
             function (switchData) {
                 for (const monitor of this._switchData.monitors) {
                     for (const workspace of monitor._workspaceGroups) {
-                        for (const {clone} of workspace._windowRecords) {
+                        for (const { clone } of workspace._windowRecords) {
                             (
                                 clone as WsAnimationActor
                             )._shadow_clone?.destroy();
@@ -405,68 +389,72 @@ export default class RoundedWindowCornersReborn extends Extension {
 const OverviewShadowActor = GObject.registerClass(
     {},
     class extends Clutter.Clone {
-        _window_preview!: WindowPreview;
+        _target!: Clutter.Actor;
+        _actor!: Meta.WindowActor;
 
         /**
          * Create shadow actor for WindowPreview in overview
          * @param source the shadow actor create for rounded corners shadow
          * @param window_preview the window preview has shown in overview
          */
-        constructor(source: Clutter.Actor, window_preview: WindowPreview) {
+        constructor(
+            source: Clutter.Actor,
+            target: Clutter.Actor,
+        ) {
             super({
                 source, // the source shadow actor shown in desktop
                 name: constants.OVERVIEW_SHADOW_ACTOR,
                 pivotPoint: new Graphene.Point().init(0.5, 0.5),
             });
 
-            this._window_preview = window_preview;
+            this._target = target;
         }
 
-        /**
-         * Recompute the position and size of shadow in overview
-         * This virtual function will be called when we:
-         * - entering/closing overview
-         * - dragging window
-         * - position and size of window preview in overview changed
-         * @param box The bound box of shadow actor
-         */
         vfunc_allocate(box: Clutter.ActorBox): void {
-            const leaving_overview =
-                overview._overview.controls._workspacesDisplay._leavingOverview;
-
-            // The window container that shown in overview
-            const windowContainerBox = leaving_overview
-                ? this._window_preview.windowContainer.get_allocation_box()
-                : this._window_preview.get_allocation_box();
-
-            // Meta.Window contain the all information about a window
-            const meta_win =
-                this._window_preview._windowActor.get_meta_window();
-            if (!meta_win) {
+            const window_actor = (this._target as Clutter.Clone).get_source() as Meta.WindowActor;
+            const meta_win = window_actor.get_meta_window();
+            const window_container = this._target.get_parent();
+            if (!(meta_win && window_container)) {
+                return;
+            }
+            // I don't really know how to properly handle attached dialog
+            // since I don't know how to get their's true position and size
+            // so let's just skip them all together
+            if (meta_win.is_attached_dialog()) {
                 return;
             }
 
-            // As we known, preview shown in overview has been scaled
-            // in overview
-            const container_scaled =
-                windowContainerBox.get_width() /
-                meta_win.get_frame_rect().width;
+
+            const frame_rect = meta_win.get_frame_rect();
+            const buf_rect = meta_win.get_buffer_rect();
+            // If this is a root window (i.e. not a modal dialog), one of it's dimensions
+            // should lineup with dimensions of window_container
+            // If it isn't this might mean, that we have relly big modal dialog
+            const scale = Math.min(
+                window_container.width / frame_rect.width,
+                window_container.height / frame_rect.height
+            );
             const paddings =
                 constants.SHADOW_PADDING *
-                container_scaled *
+                scale *
                 UI.WindowScaleFactor(meta_win);
 
-            // Setup bounds box of shadow actor
-            box.set_origin(-paddings, -paddings);
+            const x = this._target.x + (buf_rect.width - frame_rect.width) / 2 * scale
+            const y = this._target.y + (buf_rect.height - frame_rect.height) / 2 * scale
+            const width = frame_rect.width * scale - x;
+            const height = frame_rect.height * scale - y;
+            box.set_origin(
+                x - paddings,
+                y - paddings
+            );
             box.set_size(
-                windowContainerBox.get_width() + 2 * paddings,
-                windowContainerBox.get_height() + 2 * paddings,
+                width + 2 * paddings,
+                height + 2 * paddings
             );
 
-            // Make bounds box effect actor
             super.vfunc_allocate(box);
         }
     },
 );
 
-type WsAnimationActor = Clutter.Actor & {_shadow_clone?: Clutter.Actor};
+type WsAnimationActor = Clutter.Actor & { _shadow_clone?: Clutter.Actor };
